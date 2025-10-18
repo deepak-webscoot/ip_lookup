@@ -13,9 +13,43 @@ THREAT_FEEDS_DIR="/etc/ip_threat_feeds"
 # Cleanup function
 cleanup() {
     rm -f "${TEMP_PREFIX}.$$."* 2>/dev/null || true
+    # Self-delete if running from temporary location
+    if [[ "$0" =~ ^/tmp/.*\.sh$ ]] || [[ "$0" =~ ^/dev/fd/.* ]]; then
+        rm -f "$0" 2>/dev/null || true
+    fi
 }
 
 trap cleanup EXIT INT TERM
+
+# Function to install requirements
+install_requirements() {
+    echo "Checking and installing required packages..."
+    
+    local packages=("curl" "jq")
+    local to_install=()
+    
+    for pkg in "${packages[@]}"; do
+        if ! command -v "$pkg" &>/dev/null; then
+            to_install+=("$pkg")
+        fi
+    done
+    
+    if [ ${#to_install[@]} -gt 0 ]; then
+        echo "Installing missing packages: ${to_install[*]}"
+        if command -v apt-get &>/dev/null; then
+            apt-get update >/dev/null 2>&1
+            apt-get install -y "${to_install[@]}" >/dev/null 2>&1
+        elif command -v yum &>/dev/null; then
+            yum install -y "${to_install[@]}" >/dev/null 2>&1
+        else
+            echo "Error: Cannot install packages - no package manager found"
+            exit 1
+        fi
+        echo "Packages installed successfully"
+    else
+        echo "All required packages are already installed"
+    fi
+}
 
 # Display usage information
 usage() {
@@ -31,18 +65,6 @@ usage() {
     echo "  $SCRIPT_NAME dominick.fun_access_log          # Analyze current directory file"
     echo ""
 }
-
-# Check if jq is installed
-if ! command -v jq &>/dev/null; then
-    echo "Error: jq is required but not installed. Install it using: sudo apt install jq"
-    exit 1
-fi
-
-# Check if curl is installed
-if ! command -v curl &>/dev/null; then
-    echo "Error: curl is required but not installed. Install it using: sudo apt install curl"
-    exit 1
-fi
 
 # Initialize temp files
 TODAY_LOGS="${TEMP_PREFIX}.$$.today_logs"
@@ -66,7 +88,7 @@ setup_threat_feeds() {
         local filename="${list#*|}"
         local filepath="$THREAT_FEEDS_DIR/$filename"
 
-        if [[ -f "$filepath" ]] && [[ $(find "$filepath" -mtime -1 2>/dev/null | wc -l) -gt 0 ]]; then
+        if [[ -f "$filepath" ]] && [[ $(find "$filepath" -mtime -1 2>/dev/null) ]]; then
             echo "  ✓ $filename (up to date)"
         else
             echo "Downloading: $filename"
@@ -159,7 +181,8 @@ find_log_directory() {
         if [[ -d "$dir" ]]; then
             local size
             size=$(du -s "$dir" 2>/dev/null | cut -f1 || echo 0)
-            if [ "$size" -gt "$max_size" ]; then
+            # Fix: Proper numeric comparison
+            if [ "$size" -gt "$max_size" ] 2>/dev/null; then
                 max_size=$size
                 best_dir="$dir"
             fi
@@ -178,6 +201,7 @@ find_log_directory() {
 extract_todays_logs() {
     local files="$1"
     local today_pattern=$(date +"%d/%b/%Y")
+    local today_pattern_alt=$(date +"%Y-%m-%d")
 
     echo "Extracting today's ($today_pattern) requests from logs..."
 
@@ -191,7 +215,15 @@ extract_todays_logs() {
             continue
         fi
 
-        local file_lines=$(grep -c "$today_pattern" "$file" 2>/dev/null || echo 0)
+        # Try different date formats
+        local file_lines=0
+        if grep -q "$today_pattern" "$file" 2>/dev/null; then
+            file_lines=$(grep -c "$today_pattern" "$file" 2>/dev/null || echo 0)
+        elif grep -q "$today_pattern_alt" "$file" 2>/dev/null; then
+            file_lines=$(grep -c "$today_pattern_alt" "$file" 2>/dev/null || echo 0)
+            today_pattern="$today_pattern_alt"
+        fi
+
         if [ "$file_lines" -gt 0 ]; then
             grep -h "$today_pattern" "$file" >> "$TODAY_LOGS" 2>/dev/null || true
             total_lines=$((total_lines + file_lines))
@@ -233,7 +265,7 @@ extract_and_aggregate_ips() {
         print ip
     }' "$TODAY_LOGS" | sort | uniq -c | sort -nr | head -30 > "$IPS_TODAY"
 
-    echo "Found $(wc -l < "$IPS_TODAY") unique IP addresses to analyze"
+    echo "Found $(wc -l < "$IPS_TODAY" | tr -d ' ') unique IP addresses to analyze"
 }
 
 # Main execution function
@@ -242,6 +274,9 @@ main() {
 
     echo "=== Free IP Threat Intelligence ==="
     echo "Starting automated analysis..."
+
+    # Install requirements first
+    install_requirements
 
     # Setup threat intelligence
     setup_threat_feeds
@@ -297,8 +332,17 @@ main() {
     local high_risk_ips=()
 
     while read -r line; do
+        if [ -z "$line" ]; then
+            continue
+        fi
+        
         hits=$(echo "$line" | awk '{print $1}')
         ip=$(echo "$line" | awk '{print $2}')
+
+        # Skip if IP is empty
+        if [ -z "$ip" ]; then
+            continue
+        fi
 
         # Get threat intelligence data
         pulses=$(get_alienvault_data "$ip")
@@ -319,7 +363,7 @@ main() {
     if [ ${#high_risk_ips[@]} -gt 0 ]; then
         echo ""
         echo "=== ANALYSIS COMPLETE ==="
-        echo "• IPs checked: $(wc -l < "$IPS_TODAY")"
+        echo "• IPs checked: $(wc -l < "$IPS_TODAY" | tr -d ' ')"
         echo "• High-risk IPs found: ${#high_risk_ips[@]}"
 
         echo ""
@@ -334,7 +378,7 @@ main() {
     else
         echo ""
         echo "=== ANALYSIS COMPLETE ==="
-        echo "• IPs checked: $(wc -l < "$IPS_TODAY")"
+        echo "• IPs checked: $(wc -l < "$IPS_TODAY" | tr -d ' ')"
         echo "• No high-risk IPs found"
     fi
 }
