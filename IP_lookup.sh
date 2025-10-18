@@ -36,16 +36,26 @@ install_requirements() {
     
     if [ ${#to_install[@]} -gt 0 ]; then
         echo "Installing missing packages: ${to_install[*]}"
+        export DEBIAN_FRONTEND=noninteractive
         if command -v apt-get &>/dev/null; then
             apt-get update >/dev/null 2>&1
-            apt-get install -y "${to_install[@]}" >/dev/null 2>&1
+            apt-get install -y --no-install-recommends "${to_install[@]}" >/dev/null 2>&1
         elif command -v yum &>/dev/null; then
             yum install -y "${to_install[@]}" >/dev/null 2>&1
         else
             echo "Error: Cannot install packages - no package manager found"
             exit 1
         fi
-        echo "Packages installed successfully"
+        
+        # Verify installation
+        for pkg in "${to_install[@]}"; do
+            if command -v "$pkg" &>/dev/null; then
+                echo "  ✓ $pkg installed successfully"
+            else
+                echo "  ✗ Failed to install $pkg"
+                exit 1
+            fi
+        done
     else
         echo "All required packages are already installed"
     fi
@@ -182,7 +192,7 @@ find_log_directory() {
             local size
             size=$(du -s "$dir" 2>/dev/null | cut -f1 || echo 0)
             # Fix: Proper numeric comparison
-            if [ "$size" -gt "$max_size" ] 2>/dev/null; then
+            if [ "${size:-0}" -gt "${max_size:-0}" ] 2>/dev/null; then
                 max_size=$size
                 best_dir="$dir"
             fi
@@ -197,11 +207,24 @@ find_log_directory() {
     echo "$best_dir"
 }
 
+# Function to check if file is text (not binary)
+is_text_file() {
+    local file="$1"
+    if file "$file" 2>/dev/null | grep -q "text"; then
+        return 0
+    elif [[ "$file" =~ \.log$ ]] || [[ "$file" =~ access ]] || [[ "$file" =~ error ]]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
 # Function to extract today's logs from files
 extract_todays_logs() {
     local files="$1"
     local today_pattern=$(date +"%d/%b/%Y")
     local today_pattern_alt=$(date +"%Y-%m-%d")
+    local today_pattern_simple=$(date +"%d/%b")
 
     echo "Extracting today's ($today_pattern) requests from logs..."
 
@@ -215,17 +238,29 @@ extract_todays_logs() {
             continue
         fi
 
-        # Try different date formats
-        local file_lines=0
-        if grep -q "$today_pattern" "$file" 2>/dev/null; then
-            file_lines=$(grep -c "$today_pattern" "$file" 2>/dev/null || echo 0)
-        elif grep -q "$today_pattern_alt" "$file" 2>/dev/null; then
-            file_lines=$(grep -c "$today_pattern_alt" "$file" 2>/dev/null || echo 0)
-            today_pattern="$today_pattern_alt"
+        # Skip binary files
+        if ! is_text_file "$file"; then
+            echo "Warning: Skipping binary file $file" >&2
+            continue
         fi
 
-        if [ "$file_lines" -gt 0 ]; then
-            grep -h "$today_pattern" "$file" >> "$TODAY_LOGS" 2>/dev/null || true
+        # Try different date formats
+        local file_lines=0
+        local matched_pattern=""
+        
+        for pattern in "$today_pattern" "$today_pattern_alt" "$today_pattern_simple"; do
+            if grep -i "$pattern" "$file" 2>/dev/null | head -1 >/dev/null; then
+                file_lines=$(grep -c -i "$pattern" "$file" 2>/dev/null || echo 0)
+                if [ "$file_lines" -gt 0 ]; then
+                    matched_pattern="$pattern"
+                    break
+                fi
+            fi
+        done
+
+        if [ "$file_lines" -gt 0 ] && [ -n "$matched_pattern" ]; then
+            echo "  Processing $file with pattern: $matched_pattern ($file_lines lines)"
+            grep -h -i "$matched_pattern" "$file" >> "$TODAY_LOGS" 2>/dev/null || true
             total_lines=$((total_lines + file_lines))
             files_processed=$((files_processed + 1))
         fi
@@ -246,6 +281,30 @@ extract_todays_logs() {
     return 0
 }
 
+# Function to find log files
+find_log_files() {
+    local log_dir="$1"
+    
+    # Different search patterns for different log directories
+    case "$log_dir" in
+        /var/log/virtualmin)
+            find "$log_dir" -maxdepth 1 -type f \( -name "*access*log" -o -name "*ssl*log" \) \
+                ! -name "*.gz" ! -name "*.[0-9]*" | head -20
+            ;;
+        /var/log/apache2/domlogs)
+            find "$log_dir" -maxdepth 1 -type f \( -name "*" ! -name "*.gz" ! -name "*.[0-9]*" \) | head -20
+            ;;
+        /var/log/nginx|/var/log/apache2)
+            find "$log_dir" -maxdepth 1 -type f \( -name "*access*log" -o -name "*error*log" \) \
+                ! -name "*.gz" ! -name "*.[0-9]*" | head -20
+            ;;
+        *)
+            find "$log_dir" -maxdepth 1 -type f \( -name "*access*log" -o -name "*ssl*log" -o -name "*error*log" \) \
+                ! -name "*.gz" ! -name "*.[0-9]*" | head -20
+            ;;
+    esac
+}
+
 # Function to extract and aggregate IPs
 extract_and_aggregate_ips() {
     echo "Analyzing IP addresses..."
@@ -257,15 +316,19 @@ extract_and_aggregate_ips() {
         if (ip ~ /^172\.(1[6-9]|2[0-9]|3[0-1])\./) return 1
         if (ip ~ /^127\./) return 1
         if (ip ~ /^::1$/) return 1
+        if (ip ~ /^fe80::/) return 1
+        if (ip ~ /^::/) return 1
         return 0
     }
     {
         ip = $1
-        if (is_private_ip(ip)) next
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", ip)
+        if (ip == "" || is_private_ip(ip)) next
         print ip
     }' "$TODAY_LOGS" | sort | uniq -c | sort -nr | head -30 > "$IPS_TODAY"
 
-    echo "Found $(wc -l < "$IPS_TODAY" | tr -d ' ') unique IP addresses to analyze"
+    local ip_count=$(wc -l < "$IPS_TODAY" | tr -d ' ')
+    echo "Found $ip_count unique IP addresses to analyze"
 }
 
 # Main execution function
@@ -299,7 +362,7 @@ main() {
         LOG_SOURCE="Directory: $LOG_DIR"
         echo "Using log directory: $LOG_DIR"
 
-        LOG_FILES=$(find "$LOG_DIR" -maxdepth 1 -type f \( -name "*access*log" -o -name "*ssl*log" \) ! -name "*.gz" ! -name "*.[0-9]*" | head -10)
+        LOG_FILES=$(find_log_files "$LOG_DIR")
 
         if [ -z "$LOG_FILES" ]; then
             echo "Error: No accessible log files found in $LOG_DIR" >&2
@@ -307,6 +370,7 @@ main() {
         fi
 
         echo "Found $(echo "$LOG_FILES" | wc -w) current log files"
+        echo "Files: $(echo "$LOG_FILES" | tr '\n' ' ')"
     fi
 
     # Extract today's logs
@@ -330,6 +394,7 @@ main() {
 
     # Process each IP
     local high_risk_ips=()
+    local processed_ips=0
 
     while read -r line; do
         if [ -z "$line" ]; then
@@ -356,16 +421,18 @@ main() {
         if [ "$risk_level" = "HIGH" ]; then
             high_risk_ips+=("$ip")
         fi
+        
+        processed_ips=$((processed_ips + 1))
 
     done < "$IPS_TODAY"
 
     # Generate blocking recommendations
-    if [ ${#high_risk_ips[@]} -gt 0 ]; then
-        echo ""
-        echo "=== ANALYSIS COMPLETE ==="
-        echo "• IPs checked: $(wc -l < "$IPS_TODAY" | tr -d ' ')"
-        echo "• High-risk IPs found: ${#high_risk_ips[@]}"
+    echo ""
+    echo "=== ANALYSIS COMPLETE ==="
+    echo "• IPs checked: $processed_ips"
+    echo "• High-risk IPs found: ${#high_risk_ips[@]}"
 
+    if [ ${#high_risk_ips[@]} -gt 0 ]; then
         echo ""
         echo "🚨 Recommended action: Block IPs with HIGH risk score"
         echo ""
@@ -376,9 +443,6 @@ main() {
         echo ""
         echo "To unblock later: csf -dr <IP>"
     else
-        echo ""
-        echo "=== ANALYSIS COMPLETE ==="
-        echo "• IPs checked: $(wc -l < "$IPS_TODAY" | tr -d ' ')"
         echo "• No high-risk IPs found"
     fi
 }
