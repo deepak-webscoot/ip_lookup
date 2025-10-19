@@ -355,7 +355,8 @@ extract_todays_logs() {
         for pattern in "$today_pattern" "$today_pattern_alt" "$today_pattern_simple"; do
             local lines
             lines=$(grep -c -i "$pattern" "$file" 2>/dev/null || echo 0)
-            if [[ "$lines" -gt 0 ]]; then
+            # Fix: Proper numeric validation
+            if [[ "$lines" =~ ^[0-9]+$ ]] && [[ "$lines" -gt 0 ]]; then
                 file_lines="$lines"
                 matched_pattern="$pattern"
                 break
@@ -376,12 +377,28 @@ extract_todays_logs() {
         echo "  - Date format mismatch"
         echo "  - Timezone differences"
         echo ""
-        echo "Try checking recent traffic instead:"
-        echo "  tail -20 /var/log/virtualmin/dominick.fun_access_log"
-        return 1
+        echo "Trying to find recent logs (last 50 lines)..."
+        
+        # Try to get recent logs regardless of date
+        > "$TODAY_LOGS"
+        while IFS= read -r file; do
+            if [[ -r "$file" ]] && is_text_file "$file"; then
+                echo "  Checking recent entries in: $file"
+                tail -50 "$file" >> "$TODAY_LOGS" 2>/dev/null || true
+            fi
+        done <<< "$files"
+        
+        # Check if we got any content
+        if [[ -s "$TODAY_LOGS" ]]; then
+            total_lines=$(wc -l < "$TODAY_LOGS" 2>/dev/null || echo 0)
+            echo "Using recent logs instead: $total_lines lines"
+        else
+            echo "No log content found at all."
+            return 1
+        fi
+    else
+        echo "Extracted $total_lines log entries from $files_processed files"
     fi
-
-    echo "Extracted $total_lines log entries from $files_processed files"
     return 0
 }
 
@@ -510,7 +527,7 @@ analyze_ips() {
 
     done < "$IPS_TODAY"
 
-    # Return results via global variables (bash 4.3+)
+    # Return results via global variables
     ANALYZED_IPS="$processed_ips"
     HIGH_RISK_IPS=("${high_risk_ips[@]}")
 }
@@ -565,12 +582,13 @@ main() {
             return 1
         fi
 
-        echo "Found $(echo "$LOG_FILES" | wc -w) current log files"
+        file_count=$(echo "$LOG_FILES" | wc -w)
+        echo "Found $file_count current log files"
     fi
 
     # Extract today's logs
     if ! extract_todays_logs "$LOG_FILES"; then
-        echo "Analysis stopped: No today's logs found"
+        echo "Analysis stopped: No logs found"
         return 1
     fi
 
