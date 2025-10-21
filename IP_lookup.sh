@@ -304,7 +304,7 @@ main() {
     local today_logs="${TEMP_PREFIX}.$$.today_logs"
     local ips_today="${TEMP_PREFIX}.$$.ips_today"
 
-    echo "Finding recent CURRENT log files (excluding rotated logs)..."
+#    echo "Finding recent CURRENT log files (excluding rotated logs)..."
 
     # Find CURRENT log files only (no .1, .2 files)
     local log_files
