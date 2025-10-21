@@ -167,7 +167,7 @@ get_risk_level() {
 # Find log directory
 find_log_directory() {
     # Prioritize Apache domlogs first, then other locations
-    local candidates=(/var/log/apache2/domlogs /var/log/virtualmin /var/log/nginx /var/log/apache2)
+    local candidates=(/var/log/apache2/domlogs /var/log/virtualmin /var/log/nginx )
     local best_dir=""
     local max_size=0
 
