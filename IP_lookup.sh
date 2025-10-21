@@ -3,15 +3,21 @@
 set -euo pipefail
 
 # Script: ip_lookup_abuse_free.sh
-# Description: 100% Free IP Threat Intelligence Analyzer
+# Description: 100% Free IP Threat Intelligence using AlienVault OTX + Blocklists
 
 SCRIPT_NAME="ip_lookup_abuse_free.sh"
-CACHE_DIR="${HOME}/.cache/abuseipdb"
+CACHE_DIR="/var/cache/abuseipdb"
+THREAT_FEEDS_DIR="/etc/ip_threat_feeds"
 TEMP_PREFIX="/tmp/ip_lookup_abuse"
-THREAT_FEEDS_DIR="${HOME}/.config/ip_threat_feeds"
+OTX_API_KEY="ad3be64c61425dcbca6a5dbd43f3c8e056ced8f3c2662dc5248c20815c083564"
 
-# Create necessary directories
-mkdir -p "$CACHE_DIR" "$THREAT_FEEDS_DIR"
+# Blocklist URLs - 100% FREE, no accounts needed
+BLOCKLIST_URLS=(
+    "https://feodotracker.abuse.ch/downloads/ipblocklist.txt"
+    "https://rules.emergingthreats.net/blockrules/compromised-ips.txt"
+    "https://blocklist.greensnow.co/greensnow.txt"
+    "https://www.binarydefense.com/banlist.txt"
+)
 
 # Cleanup function
 cleanup() {
@@ -20,260 +26,133 @@ cleanup() {
 
 trap cleanup EXIT INT TERM
 
-# Function to install requirements
-install_requirements() {
-    echo "Checking and installing required packages..."
-    
-    local packages=("curl" "jq")
-    local to_install=()
-    
-    # Check for required packages
-    for pkg in "${packages[@]}"; do
-        if ! command -v "$pkg" &>/dev/null; then
-            to_install+=("$pkg")
-            echo "  - $pkg needs installation"
-        else
-            echo "  ✓ $pkg already installed"
+# Display usage
+usage() {
+    echo "=== 100% FREE IP Threat Intelligence ==="
+    echo "Usage: $0"
+    echo ""
+    echo "This script automatically:"
+    echo "• Downloads free threat intelligence feeds"
+    echo "• Checks IPs against AlienVault OTX + 4 blocklists"
+    echo "• Provides risk scoring for automated blocking"
+    echo "• Requires NO paid APIs or subscriptions"
+    exit 0
+}
+
+if [[ "$#" -gt 0 ]] && [[ "$1" =~ ^(-h|--help)$ ]]; then
+    usage
+fi
+
+# Check and install dependencies
+check_dependencies() {
+    local deps=("jq" "curl" "wget")
+    local missing=()
+
+    for dep in "${deps[@]}"; do
+        if ! command -v "$dep" &>/dev/null; then
+            missing+=("$dep")
         fi
     done
-    
-    if [ ${#to_install[@]} -gt 0 ]; then
-        echo "Installing missing packages: ${to_install[*]}"
-        
-        # Try different package managers with timeout
-        if command -v apt-get &>/dev/null; then
-            echo "Using apt-get package manager..."
-            export DEBIAN_FRONTEND=noninteractive
-            if ! timeout 120 apt-get update; then
-                echo "Warning: apt-get update had issues, but continuing..."
-            fi
-            if ! timeout 300 apt-get install -y --no-install-recommends "${to_install[@]}"; then
-                echo "Warning: Package installation had issues, but continuing..."
-            fi
-        elif command -v yum &>/dev/null; then
-            echo "Using yum package manager..."
-            if ! timeout 300 yum install -y "${to_install[@]}"; then
-                echo "Warning: Package installation had issues, but continuing..."
-            fi
-        elif command -v dnf &>/dev/null; then
-            echo "Using dnf package manager..."
-            if ! timeout 300 dnf install -y "${to_install[@]}"; then
-                echo "Warning: Package installation had issues, but continuing..."
-            fi
-        else
-            echo "Error: No supported package manager found (apt-get, yum, dnf)"
-            echo "Please install these packages manually: ${to_install[*]}"
-            return 1
-        fi
-        
-        # Verify installation
-        echo "Verifying installation..."
-        local all_success=true
-        for pkg in "${to_install[@]}"; do
-            if command -v "$pkg" &>/dev/null; then
-                echo "  ✓ $pkg installed successfully"
-            else
-                echo "  ⚠ $pkg may not be fully installed"
-                all_success=false
-            fi
-        done
-        
-        if ! $all_success; then
-            echo "Warning: Some packages may not be fully installed, but continuing..."
-        fi
-    else
-        echo "All required packages are already installed"
+
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        echo "Installing missing dependencies: ${missing[*]}"
+        apt update && apt install -y "${missing[@]}" 2>/dev/null || {
+            echo "Error: Failed to install dependencies. Please run: sudo apt update && sudo apt install jq curl wget"
+            exit 1
+        }
     fi
-    
-    # Final test of critical commands
-    echo "Testing critical commands..."
-    if ! command -v curl &>/dev/null; then
-        echo "Error: curl is required but not available. Please install it manually."
-        return 1
-    fi
-    
-    if ! command -v jq &>/dev/null; then
-        echo "Error: jq is required but not available. Please install it manually."
-        return 1
-    fi
-    
-    echo "Package requirements check completed successfully"
-    return 0
 }
 
-# Display usage information
-usage() {
-    cat << EOF
-$SCRIPT_NAME - Free IP Threat Intelligence Analyzer
-
-Usage:
-  $SCRIPT_NAME                    # Automatic mode - finds and analyzes all recent logs
-  $SCRIPT_NAME <logfile>          # Single file mode - analyzes specific log file
-  $SCRIPT_NAME --help             # Show this help message
-
-Examples:
-  $SCRIPT_NAME                                  # Auto-detect and analyze all logs
-  $SCRIPT_NAME /var/log/nginx/access.log        # Analyze specific file
-  $SCRIPT_NAME dominick.fun_access_log          # Analyze current directory file
-
-Features:
-  - 100% free threat intelligence feeds
-  - Automatic log file detection
-  - Risk scoring based on multiple sources
-  - No API keys required
-EOF
-}
-
-# Function to setup threat intelligence feeds
+# Setup threat feeds directory and download blocklists
 setup_threat_feeds() {
     echo "Setting up free threat intelligence feeds..."
-    
+
+    # Create directories
     mkdir -p "$THREAT_FEEDS_DIR"
+    mkdir -p "$CACHE_DIR"
 
-    local blocklists=(
-        "https://feodotracker.abuse.ch/downloads/ipblocklist.txt|abuse_ch_feodo.txt"
-        "https://rules.emergingthreats.net/blockrules/compromised-ips.txt|emerging_threats_compromised.txt"
-        "https://blocklist.greensnow.co/greensnow.txt|greensnow.txt"
-        "https://www.binarydefense.com/banlist.txt|binary_defense.txt"
-        "https://www.botvrij.eu/data/ioclist.ip-dst|botvrij.txt"
-    )
-
-    local success_count=0
-    local total_count=0
-
-    for list in "${blocklists[@]}"; do
-        local url="${list%|*}"
-        local filename="${list#*|}"
+    # Download all blocklists
+    local updated=false
+    for url in "${BLOCKLIST_URLS[@]}"; do
+        local filename
+        filename=$(basename "$url")
         local filepath="$THREAT_FEEDS_DIR/$filename"
-        local cache_age=1440 # 24 hours in minutes
 
-        total_count=$((total_count + 1))
-
-        # Check if file exists and is recent enough
-        if [[ -f "$filepath" ]]; then
-            local file_age
-            if file_age=$(find "$filepath" -mmin "+$cache_age" 2>/dev/null); then
-                echo "  ✓ $filename (cached)"
-                success_count=$((success_count + 1))
-                continue
-            fi
-        fi
-
-        echo "  Downloading: $filename"
-        if timeout 30 curl -s -f --connect-timeout 15 "$url" -o "$filepath.tmp" 2>/dev/null; then
-            # Basic validation - check if file has content
-            if [[ -s "$filepath.tmp" ]]; then
+        # Download if file doesn't exist or is older than 24 hours
+        if [[ ! -f "$filepath" ]] || find "$filepath" -mtime +0 | grep -q .; then
+            echo "Downloading: $filename"
+            if wget -q -O "$filepath.tmp" "$url"; then
                 mv "$filepath.tmp" "$filepath"
-                echo "    ✓ Success ($(wc -l < "$filepath" | tr -d ' ') entries)"
-                success_count=$((success_count + 1))
+                updated=true
+                echo "  ✓ Success"
             else
-                echo "    ⚠ Empty response, keeping old version if exists"
+                echo "  ✗ Failed to download $filename"
                 rm -f "$filepath.tmp"
-                if [[ -f "$filepath" ]]; then
-                    success_count=$((success_count + 1))
-                fi
             fi
         else
-            echo "    ⚠ Download failed, keeping old version if exists"
-            rm -f "$filepath.tmp"
-            if [[ -f "$filepath" ]]; then
-                success_count=$((success_count + 1))
-            fi
+            echo "  ✓ $filename (up to date)"
         fi
     done
 
-    echo "Threat feeds updated: $success_count/$total_count successful"
-    
-    if [[ $success_count -eq 0 ]]; then
-        echo "Warning: No threat feeds could be downloaded. Continuing with limited functionality."
+    if [[ "$updated" == true ]]; then
+        echo "Threat feeds updated successfully"
+    else
+        echo "Threat feeds are up to date"
     fi
 }
 
-# Function to check if IP is in blocklists
+# Check if IP is in any blocklist (INSTANT check)
 check_blocklists() {
     local ip="$1"
-    local count=0
+    local matches=0
 
-    # Validate IP format
-    if ! [[ "$ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
-        echo "0"
-        return
-    fi
-
-    for blockfile in "$THREAT_FEEDS_DIR"/*.txt; do
-        if [[ -f "$blockfile" ]] && grep -q "^$ip$" "$blockfile" 2>/dev/null; then
-            ((count++))
+    for file in "$THREAT_FEEDS_DIR"/*.txt; do
+        if [[ -f "$file" ]] && grep -q "^$ip$" "$file" 2>/dev/null; then
+            ((matches++))
         fi
     done
 
-    echo "$count"
+    echo "$matches"
 }
 
-# Function to get threat intelligence data
-get_threat_intel() {
+# Get AlienVault OTX data
+get_otx_data() {
     local ip="$1"
-    
-    # Validate IP format
-    if ! [[ "$ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
-        echo "0" # Invalid IP format
-        return
-    fi
-
-    # Use multiple free sources for threat intelligence
-    local pulses=0
-    
-    # Check AbuseIPDB (public API)
-    local abuse_data
-    if abuse_data=$(timeout 10 curl -s "https://api.abuseipdb.com/api/v2/check?ipAddress=$ip" -H "Accept: application/json" 2>/dev/null); then
-        local abuse_score
-        if abuse_score=$(echo "$abuse_data" | jq -r '.data.abuseConfidenceScore // 0' 2>/dev/null); then
-            if [[ "$abuse_score" =~ ^[0-9]+$ ]] && [[ "$abuse_score" -gt 50 ]]; then
-                pulses=$((pulses + 2))
-            elif [[ "$abuse_score" -gt 20 ]]; then
-                pulses=$((pulses + 1))
-            fi
-        fi
-    fi
-    
-    # Check other public sources (with proper error handling)
-    local virustotal_data
-    if virustotal_data=$(timeout 10 curl -s "https://www.virustotal.com/ui/ip_addresses/$ip" 2>/dev/null); then
-        if echo "$virustotal_data" | jq -e '.data.attributes.last_analysis_stats.malicious > 0' &>/dev/null; then
-            pulses=$((pulses + 1))
-        fi
-    fi
-
-    echo "$pulses"
+    local data
+    data=$(curl -s --connect-timeout 10 --max-time 15 \
+           "https://otx.alienvault.com/api/v1/indicators/IPv4/$ip/general" \
+           -H "X-OTX-API-KEY: $OTX_API_KEY" 2>/dev/null || echo '{}')
+    echo "$data"
 }
 
-# Function to calculate risk score
+# Calculate risk score
 calculate_risk_score() {
     local pulses="$1"
-    local blocklists="$2"
+    local blocklist_matches="$2"
 
+    # Pulse-based scoring (0-70 points)
     local pulse_score=0
-    if [[ "$pulses" -gt 3 ]]; then
+    if [[ $pulses -gt 10 ]]; then
         pulse_score=70
-    elif [[ "$pulses" -gt 1 ]]; then
+    elif [[ $pulses -gt 5 ]]; then
         pulse_score=50
-    elif [[ "$pulses" -gt 0 ]]; then
+    elif [[ $pulses -gt 2 ]]; then
         pulse_score=30
+    elif [[ $pulses -gt 0 ]]; then
+        pulse_score=10
     fi
 
-    local blocklist_score=$((blocklists * 15))
-    if [[ "$blocklist_score" -gt 45 ]]; then
-        blocklist_score=45
+    # Blocklist matches (0-30 points)
+    local blocklist_score=$((blocklist_matches * 8))
+    if [[ $blocklist_score -gt 30 ]]; then
+        blocklist_score=30
     fi
 
     local total_score=$((pulse_score + blocklist_score))
-    if [[ "$total_score" -gt 100 ]]; then
-        total_score=100
-    fi
-    
     echo "$total_score"
 }
 
-# Function to get risk level
+# Get risk level
 get_risk_level() {
     local score="$1"
     if [[ "$score" -ge 70 ]]; then
@@ -285,369 +164,308 @@ get_risk_level() {
     fi
 }
 
-# Function to find log directory
+# Find log directory
 find_log_directory() {
-    local candidates=(/var/log/virtualmin /var/log/nginx /var/log/apache2/domlogs /var/log/apache2 /var/log)
+    # Prioritize Apache domlogs first, then other locations
+    local candidates=(/var/log/apache2/domlogs /var/log/virtualmin /var/log/nginx /var/log/apache2)
     local best_dir=""
     local max_size=0
 
     for dir in "${candidates[@]}"; do
-        if [[ -d "$dir" ]] && [[ -r "$dir" ]]; then
+        if [[ -d "$dir" ]]; then
             local size
             size=$(du -s "$dir" 2>/dev/null | cut -f1 || echo 0)
-            # Safe numeric comparison
-            if [[ "$size" =~ ^[0-9]+$ ]] && [[ "$size" -gt "$max_size" ]]; then
-                max_size="$size"
+            if [[ "$size" -gt "$max_size" ]]; then
+                max_size=$size
                 best_dir="$dir"
             fi
         fi
     done
 
     if [[ -z "$best_dir" ]]; then
-        echo "Error: No suitable log directory found." >&2
-        return 1
+        echo "Error: No log directory found" >&2
+        exit 1
     fi
 
     echo "$best_dir"
 }
 
-# Function to check if file is text (not binary)
-is_text_file() {
-    local file="$1"
-    if file "$file" 2>/dev/null | grep -q "text"; then
-        return 0
-    elif [[ "$file" =~ \.log$ ]] || [[ "$file" =~ access ]] || [[ "$file" =~ error ]]; then
-        return 0
+# Extract domain from filename (SMART VERSION)
+extract_domain_from_filename() {
+    local filename="$1"
+
+    # Remove directory path
+    local basename
+    basename=$(basename "$filename")
+
+    # Remove common suffixes and extract domain
+    local domain
+    domain=$(echo "$basename" | sed -E 's/[_\-](access|ssl|log|domlog).*$//' | sed -E 's/\.(log|access|ssl).*$//')
+
+    # Validate it looks like a domain (has a dot and valid TLD pattern)
+    if [[ "$domain" =~ [a-zA-Z0-9-]+\.[a-zA-Z]{2,} ]]; then
+        echo "$domain"
     else
-        return 1
+        echo "Unknown"
     fi
 }
 
-# Function to extract today's logs from files
-extract_todays_logs() {
-    local files="$1"
-    local today_pattern=$(date +"%d/%b/%Y")
-    local today_pattern_alt=$(date +"%Y-%m-%d")
-    local today_pattern_simple=$(date +"%d/%b")
+# SIMPLE domain detection - just use the domain from the aggregated logs
+get_domain_for_ip_simple() {
+    local ip="$1"
+    local today_logs="${TEMP_PREFIX}.$$.today_logs"
 
-    echo "Extracting today's ($today_pattern) requests from logs..."
+    # Extract domain from log lines containing this IP
+    local domain_line
+    domain_line=$(grep " $ip " "$today_logs" | head -1)
 
-    > "$TODAY_LOGS"
-    local total_lines=0
-    local files_processed=0
-
-    while IFS= read -r file; do
-        if [[ -z "$file" ]] || [[ ! -r "$file" ]]; then
-            echo "Warning: Cannot read log file '$file', skipping..." >&2
-            continue
+    if [[ -n "$domain_line" ]]; then
+        # For Virtualmin logs, the domain is often in the first field with port
+        local first_field
+        first_field=$(echo "$domain_line" | awk '{print $1}')
+        if [[ "$first_field" =~ : ]]; then
+            local domain
+            domain=$(echo "$first_field" | cut -d: -f1)
+            echo "$domain"
+            return
         fi
-
-        # Skip binary files
-        if ! is_text_file "$file"; then
-            echo "Warning: Skipping binary file $file" >&2
-            continue
-        fi
-
-        # Try different date formats
-        local file_lines=0
-        local matched_pattern=""
-        
-        for pattern in "$today_pattern" "$today_pattern_alt" "$today_pattern_simple"; do
-            local lines
-            lines=$(grep -c -i "$pattern" "$file" 2>/dev/null || echo 0)
-            # Fix: Proper numeric validation
-            if [[ "$lines" =~ ^[0-9]+$ ]] && [[ "$lines" -gt 0 ]]; then
-                file_lines="$lines"
-                matched_pattern="$pattern"
-                break
-            fi
-        done
-
-        if [[ "$file_lines" -gt 0 ]] && [[ -n "$matched_pattern" ]]; then
-            echo "  Processing $file with pattern: $matched_pattern ($file_lines lines)"
-            grep -h -i "$matched_pattern" "$file" >> "$TODAY_LOGS" 2>/dev/null || true
-            total_lines=$((total_lines + file_lines))
-            files_processed=$((files_processed + 1))
-        fi
-    done <<< "$files"
-
-    if [[ "$total_lines" -eq 0 ]]; then
-        echo "No today's traffic found in logs. Possible reasons:"
-        echo "  - No traffic today"
-        echo "  - Date format mismatch"
-        echo "  - Timezone differences"
-        echo ""
-        echo "Trying to find recent logs (last 50 lines)..."
-        
-        # Try to get recent logs regardless of date
-        > "$TODAY_LOGS"
-        while IFS= read -r file; do
-            if [[ -r "$file" ]] && is_text_file "$file"; then
-                echo "  Checking recent entries in: $file"
-                tail -50 "$file" >> "$TODAY_LOGS" 2>/dev/null || true
-            fi
-        done <<< "$files"
-        
-        # Check if we got any content
-        if [[ -s "$TODAY_LOGS" ]]; then
-            total_lines=$(wc -l < "$TODAY_LOGS" 2>/dev/null || echo 0)
-            echo "Using recent logs instead: $total_lines lines"
-        else
-            echo "No log content found at all."
-            return 1
-        fi
-    else
-        echo "Extracted $total_lines log entries from $files_processed files"
     fi
-    return 0
+
+    echo "Unknown"
 }
 
-# Function to find log files
-find_log_files() {
+# Show recent raw log entries for high-risk IPs using grep -Rai
+show_recent_raw_logs() {
+    local high_risk_ips=("$@")
     local log_dir="$1"
-    
-    if [[ ! -d "$log_dir" ]] || [[ ! -r "$log_dir" ]]; then
-        echo "Error: Cannot access log directory: $log_dir" >&2
-        return 1
+
+    if [[ ${#high_risk_ips[@]} -eq 0 ]]; then
+        return
     fi
 
-    # Different search patterns for different log directories
-    case "$log_dir" in
-        /var/log/virtualmin)
-            find "$log_dir" -maxdepth 1 -type f \( -name "*access*log" -o -name "*ssl*log" \) \
-                ! -name "*.gz" ! -name "*.[0-9]*" 2>/dev/null | head -20
-            ;;
-        /var/log/apache2/domlogs)
-            find "$log_dir" -maxdepth 1 -type f \( -name "*" ! -name "*.gz" ! -name "*.[0-9]*" \) 2>/dev/null | head -20
-            ;;
-        /var/log/nginx|/var/log/apache2)
-            find "$log_dir" -maxdepth 1 -type f \( -name "*access*log" -o -name "*error*log" \) \
-                ! -name "*.gz" ! -name "*.[0-9]*" 2>/dev/null | head -20
-            ;;
-        *)
-            find "$log_dir" -maxdepth 1 -type f \( -name "*access*log" -o -name "*ssl*log" -o -name "*error*log" \) \
-                ! -name "*.gz" ! -name "*.[0-9]*" 2>/dev/null | head -20
-            ;;
-    esac
+    echo ""
+    echo "🔍 RECENT LOG ENTRIES FOR HIGH-RISK IPs:"
+    echo "=============================================="
+
+    for ip in "${high_risk_ips[@]}"; do
+        echo ""
+        echo "🚨 HIGH-RISK IP: $ip"
+        echo "----------------------------------------------"
+
+        # Use grep -Rai to search through all log files recursively
+        local recent_entries
+        recent_entries=$(grep -Rai "$ip" "$log_dir" 2>/dev/null | tail -5)
+
+        if [[ -n "$recent_entries" ]]; then
+            echo "Recent log entries:"
+            echo "---"
+            echo "$recent_entries"
+        else
+            echo "    No recent log entries found in $log_dir"
+        fi
+        echo ""
+    done
 }
 
-# Function to extract and aggregate IPs
-extract_and_aggregate_ips() {
-    echo "Analyzing IP addresses..."
+# Find CURRENT log files (not rotated)
+find_current_log_files() {
+    local log_dir="$1"
+    # Find access log files that are NOT rotated (no .1, .2, etc.) and NOT error logs
+    find "$log_dir" -maxdepth 1 -type f \( -name "*access*log" -o -name "*ssl*log" -o -name "*.log" \) \
+         ! -name "*.gz" ! -name "*.*[0-9]" ! -name "*_error*" 2>/dev/null | head -20
+}
 
-    # Initialize temp file
-    > "$IPS_TODAY"
+# Main function
+main() {
+    echo "=== 100% FREE IP Threat Intelligence ==="
+    echo "Starting automated analysis..."
 
+    # Check dependencies
+    check_dependencies
+
+    # Setup threat feeds
+    setup_threat_feeds
+
+    # Find and process logs
+    local log_dir
+    log_dir=$(find_log_directory)
+    echo "Using log directory: $log_dir"
+
+    # Create temp files
+    local today_logs="${TEMP_PREFIX}.$$.today_logs"
+    local ips_today="${TEMP_PREFIX}.$$.ips_today"
+
+    echo "Finding recent CURRENT log files (excluding rotated logs)..."
+
+    # Find CURRENT log files only (no .1, .2 files)
+    local log_files
+    log_files=$(find_current_log_files "$log_dir")
+
+    if [[ -z "$log_files" ]]; then
+        echo "Error: No current log files found" >&2
+        exit 1
+    fi
+
+    # Show which log files we found
+    echo "Found CURRENT log files:"
+    for file in $log_files; do
+        local domain
+        domain=$(extract_domain_from_filename "$file")
+        echo "  📄 $(basename "$file") → Domain: $domain"
+    done
+
+    local today_pattern
+    today_pattern=$(date +"%d/%b/%Y")
+    echo ""
+    echo "Extracting today's ($today_pattern) traffic from CURRENT logs..."
+
+    # Extract today's logs from CURRENT files only
+    for file in $log_files; do
+        if [[ -r "$file" ]]; then
+            grep -h "$today_pattern" "$file" 2>/dev/null || true
+        fi
+    done > "$today_logs"
+
+    local log_count
+    log_count=$(wc -l < "$today_logs" 2>/dev/null || echo 0)
+
+    if [[ $log_count -eq 0 ]]; then
+        echo "No today's traffic found in current logs. Checking all dates in current logs..."
+        # If no today's traffic, use all traffic from current logs
+        for file in $log_files; do
+            if [[ -r "$file" ]]; then
+                cat "$file" 2>/dev/null || true
+            fi
+        done > "$today_logs"
+        log_count=$(wc -l < "$today_logs" 2>/dev/null || echo 0)
+    fi
+
+    if [[ $log_count -eq 0 ]]; then
+        echo "Error: No log entries found in current log files" >&2
+        exit 1
+    fi
+
+    echo "Found $log_count log entries"
+
+    # Extract unique IPs
+    echo "Extracting IP addresses..."
     awk '
     function is_private_ip(ip) {
         if (ip ~ /^10\./) return 1
         if (ip ~ /^192\.168\./) return 1
         if (ip ~ /^172\.(1[6-9]|2[0-9]|3[0-1])\./) return 1
         if (ip ~ /^127\./) return 1
-        if (ip ~ /^::1$/) return 1
-        if (ip ~ /^fe80::/) return 1
-        if (ip ~ /^::/) return 1
-        return 0
-    }
-    function is_valid_ip(ip) {
-        if (ip ~ /^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$/) return 1
         return 0
     }
     {
         ip = $1
-        gsub(/^[[:space:]]+|[[:space:]]+$/, "", ip)
-        if (ip == "" || !is_valid_ip(ip) || is_private_ip(ip)) next
+        if (is_private_ip(ip)) next
         print ip
-    }' "$TODAY_LOGS" | sort | uniq -c | sort -nr | head -30 > "$IPS_TODAY"
+    }' "$today_logs" | sort | uniq -c | sort -nr | head -30 > "$ips_today"
 
     local ip_count
-    ip_count=$(wc -l < "$IPS_TODAY" 2>/dev/null | tr -d ' ' || echo 0)
-    
-    if [[ "$ip_count" -eq 0 ]]; then
-        echo "No valid IP addresses found to analyze"
-        return 1
-    fi
-    
-    echo "Found $ip_count unique IP addresses to analyze"
-    return 0
-}
+    ip_count=$(wc -l < "$ips_today" 2>/dev/null || echo 0)
 
-# Function to analyze IPs with progress
-analyze_ips() {
-    local high_risk_ips=()
-    local processed_ips=0
-    local total_ips=0
-    
-    total_ips=$(wc -l < "$IPS_TODAY" 2>/dev/null || echo 0)
-    
-    if [[ "$total_ips" -eq 0 ]]; then
-        echo "No IPs to analyze"
-        return 1
+    if [[ $ip_count -eq 0 ]]; then
+        echo "No valid IP addresses found for analysis"
+        exit 0
     fi
 
+    echo "Analyzing $ip_count unique IP addresses..."
+
+    # Display results header with explanations
     echo ""
     echo "LEGEND:"
-    echo "• Pulses = Threat intelligence score from multiple sources"
+    echo "• Pulses = Number of threat intelligence feeds reporting this IP"
     echo "• BLists = Number of blocklists containing this IP"
     echo "• Score = Risk score (0-100), HIGH = 70+, MEDIUM = 30-69, LOW = 0-29"
     echo ""
-    printf "%-6s %-18s %-8s %-8s %-6s %-5s\n" "Hits" "IP" "Pulses" "BLists" "Score" "Risk"
-    echo "----------------------------------------------------------------"
+    printf "%-6s %-18s %-12s %-8s %-8s %-6s %-8s %s\n" "Hits" "IP" "Country" "Pulses" "BLists" "Score" "Risk" "Domain"
+    echo "----------------------------------------------------------------------------------------------------"
 
-    while IFS= read -r line; do
-        if [[ -z "$line" ]]; then
-            continue
-        fi
-        
+    local high_risk_ips=()
+
+    # Process each IP
+    while read -r line; do
+        local hits
         hits=$(echo "$line" | awk '{print $1}')
+        local ip
         ip=$(echo "$line" | awk '{print $2}')
 
-        # Skip if IP is empty or invalid
-        if [[ -z "$ip" ]] || ! [[ "$ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+        # Skip if IP is empty
+        if [[ -z "$ip" ]]; then
             continue
         fi
 
-        # Get threat intelligence data
-        pulses=$(get_threat_intel "$ip")
-        blocklists=$(check_blocklists "$ip")
-        risk_score=$(calculate_risk_score "$pulses" "$blocklists")
+        # SIMPLE domain detection
+        local domain
+        domain=$(get_domain_for_ip_simple "$ip")
+
+        # Shorten domain for display
+        if [[ ${#domain} -gt 20 ]]; then
+            domain_display="${domain:0:17}..."
+        else
+            domain_display="$domain"
+        fi
+
+        # INSTANT check: Blocklists (0.001 seconds)
+        local blocklist_matches
+        blocklist_matches=$(check_blocklists "$ip")
+
+        # API check: AlienVault OTX (2-3 seconds)
+        local otx_data
+        otx_data=$(get_otx_data "$ip")
+        local pulses
+        pulses=$(echo "$otx_data" | jq -r '.pulse_info.count // 0' 2>/dev/null || echo 0)
+        local country
+        country=$(echo "$otx_data" | jq -r '.country_name // "Unknown"' 2>/dev/null || echo "Unknown")
+
+        # Shorten country name if too long
+        if [[ ${#country} -gt 10 ]]; then
+            country="${country:0:9}."
+        fi
+
+        # Calculate risk score
+        local risk_score
+        risk_score=$(calculate_risk_score "$pulses" "$blocklist_matches")
+        local risk_level
         risk_level=$(get_risk_level "$risk_score")
 
-        printf "%-6s %-18s %-8s %-8s %-6s %-5s\n" \
-               "$hits" "$ip" "$pulses" "$blocklists" "$risk_score" "$risk_level"
-
-        if [[ "$risk_level" = "HIGH" ]]; then
+        # Track high-risk IPs for detailed logs
+        if [[ "$risk_level" == "HIGH" ]]; then
             high_risk_ips+=("$ip")
         fi
-        
-        processed_ips=$((processed_ips + 1))
-        
-        # Small delay to be respectful to APIs
-        sleep 0.5
 
-    done < "$IPS_TODAY"
+        # Display results
+        printf "%-6s %-18s %-12s %-8s %-8s %-6s %-8s %s\n" \
+               "$hits" "$ip" "$country" "$pulses" "$blocklist_matches" "$risk_score" "$risk_level" "$domain_display"
 
-    # Return results via global variables
-    ANALYZED_IPS="$processed_ips"
-    HIGH_RISK_IPS=("${high_risk_ips[@]}")
-}
+        # Rate limiting for API calls
+        sleep 1
 
-# Main execution function
-main() {
-    local specific_file="${1:-}"
-    
-    # Initialize temp files
-    TODAY_LOGS="${TEMP_PREFIX}.$$.today_logs"
-    IPS_TODAY="${TEMP_PREFIX}.$$.ips_today"
+    done < "$ips_today"
 
-    echo "=== Free IP Threat Intelligence Analyzer ==="
-    echo "Starting automated analysis..."
+    # FIXED: Call show_recent_raw_logs with correct parameters
+    show_recent_raw_logs "${high_risk_ips[@]}" "$log_dir"
 
-    # Install requirements first (but don't exit on failure)
-    if ! install_requirements; then
-        echo "Warning: Package installation had issues, but continuing..."
-    fi
-
-    # Setup threat intelligence
-    setup_threat_feeds
-
-    # Determine log source
-    local LOG_FILES
-    local LOG_SOURCE
-
-    if [[ -n "$specific_file" ]]; then
-        if [[ ! -f "$specific_file" ]]; then
-            echo "Error: File '$specific_file' not found" >&2
-            return 1
-        fi
-        LOG_FILES="$specific_file"
-        LOG_SOURCE="File: $(basename "$specific_file")"
-        echo "Analyzing specific file: $specific_file"
-    else
-        local LOG_DIR
-        if ! LOG_DIR=$(find_log_directory); then
-            echo "Error: Could not find log directory" >&2
-            return 1
-        fi
-        LOG_SOURCE="Directory: $LOG_DIR"
-        echo "Using log directory: $LOG_DIR"
-
-        if ! LOG_FILES=$(find_log_files "$LOG_DIR"); then
-            echo "Error: Could not find log files in $LOG_DIR" >&2
-            return 1
-        fi
-
-        if [[ -z "$LOG_FILES" ]]; then
-            echo "Error: No accessible log files found in $LOG_DIR" >&2
-            return 1
-        fi
-
-        file_count=$(echo "$LOG_FILES" | wc -w)
-        echo "Found $file_count current log files"
-    fi
-
-    # Extract today's logs
-    if ! extract_todays_logs "$LOG_FILES"; then
-        echo "Analysis stopped: No logs found"
-        return 1
-    fi
-
-    # Extract and aggregate IPs
-    if ! extract_and_aggregate_ips; then
-        echo "Analysis stopped: No valid IP addresses found"
-        return 1
-    fi
-
-    # Analyze IPs
-    local ANALYZED_IPS=0
-    local HIGH_RISK_IPS=()
-    
-    analyze_ips
-
-    # Generate blocking recommendations
     echo ""
     echo "=== ANALYSIS COMPLETE ==="
-    echo "• IPs checked: $ANALYZED_IPS"
-    echo "• High-risk IPs found: ${#HIGH_RISK_IPS[@]}"
-
-    if [[ ${#HIGH_RISK_IPS[@]} -gt 0 ]]; then
-        echo ""
-        echo "🚨 Recommended action: Block IPs with HIGH risk score"
-        echo ""
-        echo "🔧 CSF blocking commands:"
-        for ip in "${HIGH_RISK_IPS[@]}"; do
-            echo "csf -d $ip  # \"Malicious IP detected via threat intelligence\""
-        done
-        echo ""
-        echo "To unblock later: csf -dr <IP>"
-        
-        # Also show iptables commands
-        echo ""
-        echo "🔧 Alternative iptables commands:"
-        for ip in "${HIGH_RISK_IPS[@]}"; do
-            echo "iptables -A INPUT -s $ip -j DROP  # Block malicious IP"
-        done
-    else
-        echo "• No high-risk IPs found requiring immediate action"
-    fi
-    
+    echo "• Sources: AlienVault OTX + 4 free blocklists"
+    echo "• IPs checked: $ip_count"
+    echo "• High-risk IPs found: ${#high_risk_ips[@]}"
     echo ""
-    echo "Note: This analysis uses free threat intelligence feeds."
-    echo "      For enterprise-grade protection, consider commercial solutions."
-}
+    echo "🚨 Recommended action: Block IPs with HIGH risk score"
 
-# Show help if requested
-if [[ $# -gt 0 ]]; then
-    case "$1" in
-        -h|--help|help)
-            usage
-            exit 0
-            ;;
-    esac
-fi
+    # Show quick blocking command
+    if [[ ${#high_risk_ips[@]} -gt 0 ]]; then
+        echo ""
+        echo "🔧 Quick blocking command:"
+        for ip in "${high_risk_ips[@]}"; do
+            echo "csf -d $ip"
+        done
+        echo ""
+    fi
+}
 
 # Run main function
 main "$@"
-
-# Exit with appropriate code
-exit $?
