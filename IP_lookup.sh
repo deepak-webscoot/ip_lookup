@@ -90,7 +90,7 @@ setup_threat_feeds() {
                 rm -f "$filepath.tmp"
             fi
         else
-            echo "  ✓ $filename (up to date)"
+            echo "  ✓ $filename (up to date)
         fi
     done
 
@@ -236,8 +236,9 @@ get_domain_for_ip_simple() {
 
 # Show recent raw log entries for high-risk IPs using grep -Rai
 show_recent_raw_logs() {
-    local high_risk_ips=("$@")
     local log_dir="$1"
+    shift
+    local high_risk_ips=("$@")
 
     if [[ ${#high_risk_ips[@]} -eq 0 ]]; then
         return
@@ -252,16 +253,24 @@ show_recent_raw_logs() {
         echo "🚨 HIGH-RISK IP: $ip"
         echo "----------------------------------------------"
 
-        # Use grep -Rai to search through all log files recursively
+        # Use grep to search through all log files for this IP
         local recent_entries
-        recent_entries=$(grep -Rai "$ip" "$log_dir" 2>/dev/null | tail -5)
+        recent_entries=$(grep -h "$ip" "$log_dir"/* 2>/dev/null | tail -5)
 
         if [[ -n "$recent_entries" ]]; then
             echo "Recent log entries:"
             echo "---"
             echo "$recent_entries"
         else
-            echo "    No recent log entries found in $log_dir"
+            # Try recursive search if direct search fails
+            recent_entries=$(find "$log_dir" -type f -name "*.log" -exec grep -h "$ip" {} \; 2>/dev/null | tail -5)
+            if [[ -n "$recent_entries" ]]; then
+                echo "Recent log entries:"
+                echo "---"
+                echo "$recent_entries"
+            else
+                echo "    No recent log entries found for $ip"
+            fi
         fi
         echo ""
     done
@@ -446,7 +455,7 @@ main() {
     done < "$ips_today"
 
     # FIXED: Call show_recent_raw_logs with correct parameters
-    show_recent_raw_logs "${high_risk_ips[@]}" "$log_dir"
+    show_recent_raw_logs "$log_dir" "${high_risk_ips[@]}"
 
     echo ""
     echo "=== ANALYSIS COMPLETE ==="
