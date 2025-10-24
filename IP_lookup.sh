@@ -3,7 +3,6 @@ set -euo pipefail
 
 # Script: ip_threat_checker.sh
 # Description: Simple IP threat intelligence using AlienVault OTX
-# Works on ANY Linux server with basic tools
 
 SCRIPT_NAME="ip_threat_checker.sh"
 OTX_API_KEY="ad3be64c61425dcbca6a5dbd43f3c8e056ced8f3c2662dc5248c20815c083564"
@@ -34,8 +33,7 @@ fi
 
 # Check dependencies
 check_dependencies() {
-    local deps=("grep" "awk" "curl" "jq" "find")
-    for dep in "${deps[@]}"; do
+    for dep in grep awk curl jq find; do
         if ! command -v "$dep" &>/dev/null; then
             echo "Error: Required tool '$dep' not found"
             exit 1
@@ -43,104 +41,102 @@ check_dependencies() {
     done
 }
 
-# Find log directory - simple approach
+# Find log directory - SIMPLE AND RELIABLE
 find_log_directory() {
-    local candidates=(
-        "/var/log/virtualmin"
-        "/var/log/apache2/domlogs"  # SPECIFICALLY for Apache domlogs
-        "/var/log/nginx"
-        "/var/log/httpd"
-    )
-    
-    for dir in "${candidates[@]}"; do
-        if [[ -d "$dir" ]]; then
-            echo "$dir"
-            return 0
-        fi
-    done
-    
-    echo "Error: No log directory found in: ${candidates[*]}" >&2
-    exit 1
+    # Check in this exact order
+    if [[ -d "/var/log/virtualmin" ]]; then
+        echo "/var/log/virtualmin"
+    elif [[ -d "/var/log/apache2/domlogs" ]]; then
+        echo "/var/log/apache2/domlogs"
+    elif [[ -d "/var/log/nginx" ]]; then
+        echo "/var/log/nginx"
+    elif [[ -d "/var/log/httpd" ]]; then
+        echo "/var/log/httpd"
+    else
+        echo "Error: No log directory found" >&2
+        exit 1
+    fi
 }
 
-# Extract today's IPs - ONE reliable method
+# Extract IPs - BULLETPROOF METHOD
 extract_todays_ips() {
     local log_dir="$1"
     local output_file="$2"
     
-    echo "Finding today's access logs..."
+    echo "Finding access logs in: $log_dir"
     
     # Get today's date in log format
     local today_pattern
     today_pattern=$(date +"%d/%b/%Y")
-    echo "Today's pattern: $today_pattern"
+    echo "Searching for logs from: $today_pattern"
     
-    # Find log files and process them
-    local log_files
-    log_files=$(find "$log_dir" -maxdepth 1 -type f \( -name "*access*log" -o -name "*.log" \) \
-                ! -name "*.gz" ! -name "*.*[0-9]" 2>/dev/null | head -10)
+    # Find ALL log files (not just today's)
+    local log_files=()
+    while IFS= read -r -d '' file; do
+        log_files+=("$file")
+    done < <(find "$log_dir" -maxdepth 1 -type f \( -name "*access*log" -o -name "*.log" \) \
+             ! -name "*.gz" ! -name "*.*[0-9]" -print0 2>/dev/null)
     
-    if [[ -z "$log_files" ]]; then
+    if [[ ${#log_files[@]} -eq 0 ]]; then
         echo "Error: No log files found in $log_dir" >&2
         return 1
     fi
     
-    echo "Found $(echo "$log_files" | wc -l) log files"
+    echo "Found ${#log_files[@]} log files"
     
-    # Process each log file for today's entries
-    local total_entries=0
-    while IFS= read -r logfile; do
+    # Process each log file
+    local total_lines=0
+    for logfile in "${log_files[@]}"; do
         if [[ ! -r "$logfile" ]]; then
+            echo "  ⚠️  Cannot read: $(basename "$logfile")"
             continue
         fi
         
-        # Count entries for this file - FIXED SYNTAX
-        local file_entries
-        file_entries=$(grep -c "$today_pattern" "$logfile" 2>/dev/null || echo "0")
+        # Count lines in this file (for progress)
+        local file_lines
+        file_lines=$(wc -l < "$logfile" 2>/dev/null || echo 0)
         
-        # Convert to integer to avoid syntax errors
-        file_entries=$((file_entries + 0))
+        echo "  📄 $(basename "$logfile"): $file_lines lines"
         
-        if [[ $file_entries -gt 0 ]]; then
-            echo "  📄 $(basename "$logfile"): $file_entries entries"
-            grep -h "$today_pattern" "$logfile" 2>/dev/null >> "/tmp/logs.$$" || true
-            total_entries=$((total_entries + file_entries))
+        # Extract today's entries OR all entries if none found
+        if grep -q "$today_pattern" "$logfile" 2>/dev/null; then
+            grep -h "$today_pattern" "$logfile" >> "/tmp/logs.$$" 2>/dev/null || true
+        else
+            # If no today's entries, use all entries from this file
+            cat "$logfile" >> "/tmp/logs.$$" 2>/dev/null || true
         fi
-    done <<< "$log_files"
+    done
     
-    if [[ $total_entries -eq 0 ]]; then
-        echo "No today's entries found. Using all current log entries..."
-        while IFS= read -r logfile; do
-            if [[ -r "$logfile" ]]; then
-                cat "$logfile" 2>/dev/null >> "/tmp/logs.$$" || true
-            fi
-        done <<< "$log_files"
-        total_entries=$(wc -l < "/tmp/logs.$$" 2>/dev/null || echo 0)
-        total_entries=$((total_entries + 0))
-    fi
+    # Check if we got any log entries
+    total_lines=$(wc -l < "/tmp/logs.$$" 2>/dev/null || echo 0)
     
-    if [[ $total_entries -eq 0 ]]; then
+    if [[ $total_lines -eq 0 ]]; then
         echo "Error: No log entries found" >&2
         return 1
     fi
     
-    echo "Processing $total_entries log entries..."
+    echo "Processing $total_lines log entries for IP extraction..."
     
-    # Extract IPs - SIMPLE AND RELIABLE
-    awk '{print $1}' "/tmp/logs.$$" | \
+    # EXTRACT IPs - SIMPLE AND RELIABLE
+    # Method 1: Try awk first field
+    awk '{print $1}' "/tmp/logs.$$" 2>/dev/null | \
     grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | \
     sort | uniq -c | sort -nr | head -30 > "$output_file"
     
-    local ip_count
-    ip_count=$(wc -l < "$output_file" 2>/dev/null || echo 0)
-    ip_count=$((ip_count + 0))
+    # Check if we got IPs
+    local ip_count=0
+    if [[ -f "$output_file" ]]; then
+        ip_count=$(wc -l < "$output_file" 2>/dev/null || echo 0)
+    fi
     
     if [[ $ip_count -eq 0 ]]; then
-        echo "Error: No IP addresses extracted" >&2
+        echo "Error: No IP addresses could be extracted"
+        echo "Debug: First 3 lines of log file:"
+        head -3 "/tmp/logs.$$" | sed 's/^/  /'
         return 1
     fi
     
-    echo "✓ Extracted $ip_count unique IP addresses"
+    echo "✓ Successfully extracted $ip_count unique IP addresses"
     return 0
 }
 
@@ -166,18 +162,18 @@ check_ip_threat() {
 get_risk_level() {
     local pulses="$1"
     
-    if [[ "$pulses" -gt 10 ]]; then
+    if [[ $pulses -gt 10 ]]; then
         echo "HIGH"
-    elif [[ "$pulses" -gt 5 ]]; then
+    elif [[ $pulses -gt 5 ]]; then
         echo "MEDIUM" 
-    elif [[ "$pulses" -gt 0 ]]; then
+    elif [[ $pulses -gt 0 ]]; then
         echo "LOW"
     else
         echo "CLEAN"
     fi
 }
 
-# Main function - straight line execution
+# Main function
 main() {
     echo "=== Simple IP Threat Intelligence ==="
     echo "Starting analysis..."
@@ -254,7 +250,7 @@ main() {
         
     done < "$ip_file"
     
-    # Step 5: Show results and recommendations
+    # Step 5: Show results
     echo ""
     echo "=== ANALYSIS COMPLETE ==="
     echo "IPs checked: $(wc -l < "$ip_file")"
