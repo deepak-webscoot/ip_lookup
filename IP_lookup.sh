@@ -167,7 +167,7 @@ get_risk_level() {
 # Find log directory
 find_log_directory() {
     # Prioritize Apache domlogs first, then other locations
-    local candidates=(/var/log/apache2/domlogs /var/log/virtualmin /var/log/nginx )
+    local candidates=(/var/log/apache2/domlogs /var/log/virtualmin /var/log/nginx /var/log/httpd)
     local best_dir=""
     local max_size=0
 
@@ -284,6 +284,158 @@ find_current_log_files() {
          ! -name "*.gz" ! -name "*.*[0-9]" ! -name "*_error*" 2>/dev/null | head -20
 }
 
+# METHOD 1: Advanced AWK IP extraction (with better error handling)
+extract_ips_method1() {
+    local today_logs="$1"
+    local ips_today="$2"
+    
+    echo "  Trying Method 1: Advanced AWK extraction..."
+    
+    awk '
+    function is_private_ip(ip) {
+        if (ip ~ /^10\./) return 1
+        if (ip ~ /^192\.168\./) return 1
+        if (ip ~ /^172\.(1[6-9]|2[0-9]|3[0-1])\./) return 1
+        if (ip ~ /^127\./) return 1
+        return 0
+    }
+    {
+        ip = $1
+        # Clean IP (remove port if present)
+        gsub(/:[0-9]+$/, "", ip)
+        if (is_private_ip(ip)) next
+        print ip
+    }' "$today_logs" | sort | uniq -c | sort -nr | head -30 > "$ips_today" 2>/dev/null
+    
+    if [[ $? -eq 0 ]] && [[ -s "$ips_today" ]]; then
+        echo "  ✓ Method 1 successful"
+        return 0
+    else
+        echo "  ✗ Method 1 failed"
+        return 1
+    fi
+}
+
+# METHOD 2: Simple AWK extraction (more compatible)
+extract_ips_method2() {
+    local today_logs="$1"
+    local ips_today="$2"
+    
+    echo "  Trying Method 2: Simple AWK extraction..."
+    
+    # Simple IP extraction without complex regex
+    awk '
+    {
+        ip = $1
+        # Clean IP (remove port if present)
+        gsub(/:[0-9]+$/, "", ip)
+        # Skip private IP ranges (simple check)
+        if (ip ~ /^10\./) next
+        if (ip ~ /^192\.168\./) next
+        if (ip ~ /^127\./) next
+        if (ip ~ /^172\.16\./) next
+        if (ip ~ /^172\.17\./) next
+        if (ip ~ /^172\.18\./) next
+        if (ip ~ /^172\.19\./) next
+        if (ip ~ /^172\.2[0-9]\./) next
+        if (ip ~ /^172\.3[0-1]\./) next
+        print ip
+    }' "$today_logs" | sort | uniq -c | sort -nr | head -30 > "$ips_today" 2>/dev/null
+    
+    if [[ $? -eq 0 ]] && [[ -s "$ips_today" ]]; then
+        echo "  ✓ Method 2 successful"
+        return 0
+    else
+        echo "  ✗ Method 2 failed"
+        return 1
+    fi
+}
+
+# METHOD 3: Basic grep + cut extraction (most compatible)
+extract_ips_method3() {
+    local today_logs="$1"
+    local ips_today="$2"
+    
+    echo "  Trying Method 3: Basic grep+cut extraction..."
+    
+    # Use grep to find IP-like patterns and cut to extract first field
+    grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' "$today_logs" 2>/dev/null | \
+    while read -r ip; do
+        # Skip private IPs
+        if [[ "$ip" =~ ^10\. ]] || [[ "$ip" =~ ^192\.168\. ]] || [[ "$ip" =~ ^127\. ]]; then
+            continue
+        fi
+        if [[ "$ip" =~ ^172\.(1[6-9]|2[0-9]|3[0-1])\. ]]; then
+            continue
+        fi
+        echo "$ip"
+    done | sort | uniq -c | sort -nr | head -30 > "$ips_today" 2>/dev/null
+    
+    if [[ $? -eq 0 ]] && [[ -s "$ips_today" ]]; then
+        echo "  ✓ Method 3 successful"
+        return 0
+    else
+        echo "  ✗ Method 3 failed"
+        return 1
+    fi
+}
+
+# METHOD 4: Ultra simple - just get first field and filter
+extract_ips_method4() {
+    local today_logs="$1"
+    local ips_today="$2"
+    
+    echo "  Trying Method 4: Ultra-simple extraction..."
+    
+    # Just get first field and do basic filtering
+    cut -d' ' -f1 "$today_logs" 2>/dev/null | \
+    grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | \
+    while read -r ip; do
+        # Remove port if present
+        ip=$(echo "$ip" | cut -d: -f1)
+        # Skip obvious private IPs
+        if [[ "$ip" == "127.0.0.1" ]] || [[ "$ip" == "::1" ]]; then
+            continue
+        fi
+        echo "$ip"
+    done | sort | uniq -c | sort -nr | head -30 > "$ips_today" 2>/dev/null
+    
+    if [[ $? -eq 0 ]] && [[ -s "$ips_today" ]]; then
+        echo "  ✓ Method 4 successful"
+        return 0
+    else
+        echo "  ✗ Method 4 failed"
+        return 1
+    fi
+}
+
+# Main IP extraction function with fallbacks
+extract_ip_addresses() {
+    local today_logs="$1"
+    local ips_today="$2"
+    
+    echo "Extracting IP addresses..."
+    
+    if [[ ! -s "$today_logs" ]]; then
+        echo "Error: Today's logs file is empty or missing" >&2
+        return 1
+    fi
+    
+    # Try each method in order until one works
+    if extract_ips_method1 "$today_logs" "$ips_today"; then
+        return 0
+    elif extract_ips_method2 "$today_logs" "$ips_today"; then
+        return 0
+    elif extract_ips_method3 "$today_logs" "$ips_today"; then
+        return 0
+    elif extract_ips_method4 "$today_logs" "$ips_today"; then
+        return 0
+    else
+        echo "Error: All IP extraction methods failed" >&2
+        return 1
+    fi
+}
+
 # Main function
 main() {
     echo "=== 100% FREE IP Threat Intelligence ==="
@@ -356,21 +508,10 @@ main() {
 
     echo "Found $log_count log entries"
 
-    # Extract unique IPs
-    echo "Extracting IP addresses..."
-    awk '
-    function is_private_ip(ip) {
-        if (ip ~ /^10\./) return 1
-        if (ip ~ /^192\.168\./) return 1
-        if (ip ~ /^172\.(1[6-9]|2[0-9]|3[0-1])\./) return 1
-        if (ip ~ /^127\./) return 1
-        return 0
-    }
-    {
-        ip = $1
-        if (is_private_ip(ip)) next
-        print ip
-    }' "$today_logs" | sort | uniq -c | sort -nr | head -30 > "$ips_today"
+    # Extract unique IPs using fallback methods
+    if ! extract_ip_addresses "$today_logs" "$ips_today"; then
+        exit 1
+    fi
 
     local ip_count
     ip_count=$(wc -l < "$ips_today" 2>/dev/null || echo 0)
