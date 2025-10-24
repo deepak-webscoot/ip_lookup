@@ -234,7 +234,7 @@ get_domain_for_ip_simple() {
     echo "Unknown"
 }
 
-# Show recent raw log entries for high-risk IPs using grep -Rai
+# Show recent raw log entries for high-risk IPs
 show_recent_raw_logs() {
     local log_dir="$1"
     shift
@@ -262,56 +262,74 @@ show_recent_raw_logs() {
             echo "---"
             echo "$recent_entries"
         else
-            # Try recursive search if direct search fails
-            recent_entries=$(find "$log_dir" -type f -name "*.log" -exec grep -h "$ip" {} \; 2>/dev/null | tail -5)
-            if [[ -n "$recent_entries" ]]; then
-                echo "Recent log entries:"
-                echo "---"
-                echo "$recent_entries"
-            else
-                echo "    No recent log entries found for $ip"
-            fi
+            echo "    No recent log entries found for $ip"
         fi
         echo ""
     done
 }
 
-# Find CURRENT log files (not rotated)
-find_current_log_files() {
-    local log_dir="$1"
-    # Find access log files that are NOT rotated (no .1, .2, etc.) and NOT error logs
-    find "$log_dir" -maxdepth 1 -type f \( -name "*access*log" -o -name "*ssl*log" -o -name "*.log" \) \
-         ! -name "*.gz" ! -name "*.*[0-9]" ! -name "*_error*" 2>/dev/null | head -20
-}
-
-# SIMPLE IP extraction using grep -Rai
+# SIMPLE IP extraction using grep with today's date
 extract_ip_addresses() {
     local log_dir="$1"
     local ips_today="$2"
     
-    echo "Extracting IP addresses using grep -Rai..."
+    echo "Extracting today's IP addresses using grep..."
     
-    # Use grep -Rai to find all IPs in log directory
-    grep -Rai -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' "$log_dir" 2>/dev/null | \
-    while read -r ip; do
-        # Skip private IPs
-        if [[ "$ip" =~ ^10\. ]] || [[ "$ip" =~ ^192\.168\. ]] || [[ "$ip" =~ ^127\. ]]; then
-            continue
+    # Get today's date pattern
+    local today_pattern
+    today_pattern=$(date +"%d/%b/%Y")
+    
+    # Create temp file for today's logs
+    local today_logs="${TEMP_PREFIX}.$$.today_logs"
+    
+    # Extract only today's logs using grep -Rai with date filter
+    echo "  Searching for today's ($today_pattern) logs in $log_dir..."
+    
+    # Use find + grep to avoid high load - process files one by one
+    find "$log_dir" -maxdepth 1 -type f \( -name "*access*log" -o -name "*ssl*log" -o -name "*.log" \) \
+         ! -name "*.gz" ! -name "*.*[0-9]" ! -name "*_error*" 2>/dev/null | \
+    while read -r file; do
+        if [[ -r "$file" ]]; then
+            grep -h "$today_pattern" "$file" 2>/dev/null || true
         fi
-        if [[ "$ip" =~ ^172\.(1[6-9]|2[0-9]|3[0-1])\. ]]; then
-            continue
-        fi
-        echo "$ip"
-    done | sort | uniq -c | sort -nr | head -30 > "$ips_today"
+    done > "$today_logs"
+    
+    local today_count=$(wc -l < "$today_logs" 2>/dev/null || echo 0)
+    
+    if [[ $today_count -eq 0 ]]; then
+        echo "  No today's logs found, using all current logs..."
+        # If no today's logs, use all current logs
+        find "$log_dir" -maxdepth 1 -type f \( -name "*access*log" -o -name "*ssl*log" -o -name "*.log" \) \
+             ! -name "*.gz" ! -name "*.*[0-9]" ! -name "*_error*" 2>/dev/null | \
+        while read -r file; do
+            if [[ -r "$file" ]]; then
+                cat "$file" 2>/dev/null || true
+            fi
+        done > "$today_logs"
+        today_count=$(wc -l < "$today_logs" 2>/dev/null || echo 0)
+    fi
+    
+    if [[ $today_count -eq 0 ]]; then
+        echo "Error: No log entries found" >&2
+        return 1
+    fi
+    
+    echo "  Found $today_count log entries"
+    
+    # Now extract IPs from today's logs using simple cut
+    echo "  Extracting IP addresses..."
+    cut -d' ' -f1 "$today_logs" 2>/dev/null | \
+    grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | \
+    sort | uniq -c | sort -nr | head -30 > "$ips_today"
     
     local result=$?
-    local line_count=$(wc -l < "$ips_today" 2>/dev/null || echo 0)
+    local ip_count=$(wc -l < "$ips_today" 2>/dev/null || echo 0)
     
-    if [[ $result -eq 0 ]] && [[ $line_count -gt 0 ]]; then
-        echo "✓ Successfully extracted $line_count unique IP addresses"
+    if [[ $result -eq 0 ]] && [[ $ip_count -gt 0 ]]; then
+        echo "✓ Successfully extracted $ip_count unique IP addresses"
         return 0
     else
-        echo "Error: Failed to extract IP addresses (result: $result, lines: $line_count)" >&2
+        echo "Error: Failed to extract IP addresses" >&2
         return 1
     fi
 }
@@ -332,63 +350,10 @@ main() {
     log_dir=$(find_log_directory)
     echo "Using log directory: $log_dir"
 
-    # Create temp files
-    local today_logs="${TEMP_PREFIX}.$$.today_logs"
+    # Create temp file for IPs
     local ips_today="${TEMP_PREFIX}.$$.ips_today"
 
-    echo "Finding recent CURRENT log files (excluding rotated logs)..."
-
-    # Find CURRENT log files only (no .1, .2 files)
-    local log_files
-    log_files=$(find_current_log_files "$log_dir")
-
-    if [[ -z "$log_files" ]]; then
-        echo "Error: No current log files found" >&2
-        exit 1
-    fi
-
-    # Show which log files we found
-    echo "Found CURRENT log files:"
-    for file in $log_files; do
-        local domain
-        domain=$(extract_domain_from_filename "$file")
-        echo "  📄 $(basename "$file") → Domain: $domain"
-    done
-
-    local today_pattern
-    today_pattern=$(date +"%d/%b/%Y")
-    echo ""
-    echo "Extracting today's ($today_pattern) traffic from CURRENT logs..."
-
-    # Extract today's logs from CURRENT files only
-    for file in $log_files; do
-        if [[ -r "$file" ]]; then
-            grep -h "$today_pattern" "$file" 2>/dev/null || true
-        fi
-    done > "$today_logs"
-
-    local log_count
-    log_count=$(wc -l < "$today_logs" 2>/dev/null || echo 0)
-
-    if [[ $log_count -eq 0 ]]; then
-        echo "No today's traffic found in current logs. Using all traffic from current logs..."
-        # If no today's traffic, use all traffic from current logs
-        for file in $log_files; do
-            if [[ -r "$file" ]]; then
-                cat "$file" 2>/dev/null || true
-            fi
-        done > "$today_logs"
-        log_count=$(wc -l < "$today_logs" 2>/dev/null || echo 0)
-    fi
-
-    if [[ $log_count -eq 0 ]]; then
-        echo "Error: No log entries found in current log files" >&2
-        exit 1
-    fi
-
-    echo "Found $log_count log entries"
-
-    # Extract unique IPs using simple grep -Rai method
+    # Extract unique IPs using simple method
     if ! extract_ip_addresses "$log_dir" "$ips_today"; then
         exit 1
     fi
@@ -429,7 +394,7 @@ main() {
 
         # SIMPLE domain detection
         local domain
-        domain=$(get_domain_for_ip_simple "$ip")
+        domain="Unknown" # Simplified for now
 
         # Shorten domain for display
         if [[ ${#domain} -gt 20 ]]; then
@@ -475,7 +440,7 @@ main() {
 
     done < "$ips_today"
 
-    # FIXED: Call show_recent_raw_logs with correct parameters
+    # Show recent logs for high-risk IPs
     show_recent_raw_logs "$log_dir" "${high_risk_ips[@]}"
 
     echo ""
