@@ -47,7 +47,7 @@ check_dependencies() {
 find_log_directory() {
     local candidates=(
         "/var/log/virtualmin"
-        "/var/log/apache2" 
+        "/var/log/apache2/domlogs"  # SPECIFICALLY for Apache domlogs
         "/var/log/nginx"
         "/var/log/httpd"
     )
@@ -94,18 +94,21 @@ extract_todays_ips() {
             continue
         fi
         
-        # Count entries for this file
+        # Count entries for this file - FIXED SYNTAX
         local file_entries
-        file_entries=$(grep -c "$today_pattern" "$logfile" 2>/dev/null || echo 0)
+        file_entries=$(grep -c "$today_pattern" "$logfile" 2>/dev/null || echo "0")
         
-        if [[ "$file_entries" -gt 0 ]]; then
+        # Convert to integer to avoid syntax errors
+        file_entries=$((file_entries + 0))
+        
+        if [[ $file_entries -gt 0 ]]; then
             echo "  📄 $(basename "$logfile"): $file_entries entries"
             grep -h "$today_pattern" "$logfile" 2>/dev/null >> "/tmp/logs.$$" || true
             total_entries=$((total_entries + file_entries))
         fi
     done <<< "$log_files"
     
-    if [[ "$total_entries" -eq 0 ]]; then
+    if [[ $total_entries -eq 0 ]]; then
         echo "No today's entries found. Using all current log entries..."
         while IFS= read -r logfile; do
             if [[ -r "$logfile" ]]; then
@@ -113,9 +116,10 @@ extract_todays_ips() {
             fi
         done <<< "$log_files"
         total_entries=$(wc -l < "/tmp/logs.$$" 2>/dev/null || echo 0)
+        total_entries=$((total_entries + 0))
     fi
     
-    if [[ "$total_entries" -eq 0 ]]; then
+    if [[ $total_entries -eq 0 ]]; then
         echo "Error: No log entries found" >&2
         return 1
     fi
@@ -129,8 +133,9 @@ extract_todays_ips() {
     
     local ip_count
     ip_count=$(wc -l < "$output_file" 2>/dev/null || echo 0)
+    ip_count=$((ip_count + 0))
     
-    if [[ "$ip_count" -eq 0 ]]; then
+    if [[ $ip_count -eq 0 ]]; then
         echo "Error: No IP addresses extracted" >&2
         return 1
     fi
