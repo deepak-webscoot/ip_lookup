@@ -284,157 +284,34 @@ find_current_log_files() {
          ! -name "*.gz" ! -name "*.*[0-9]" ! -name "*_error*" 2>/dev/null | head -20
 }
 
-# METHOD 1: Simple cut command (most reliable)
-extract_ips_method1() {
-    local today_logs="$1"
-    local ips_today="$2"
-    
-    echo "  Trying Method 1: Simple cut extraction..."
-    
-    # Just get first field and filter IPs - this should work on ALL systems
-    if [[ ! -s "$today_logs" ]]; then
-        echo "    Error: Input file is empty" >&2
-        return 1
-    fi
-    
-    # Debug: show first few lines of input
-    echo "    Debug: First 2 lines of input:"
-    head -2 "$today_logs" | sed 's/^/      /'
-    
-    cut -d' ' -f1 "$today_logs" 2>/dev/null | \
-    grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | \
-    sort | uniq -c | sort -nr | head -30 > "$ips_today"
-    
-    local result=$?
-    local line_count=$(wc -l < "$ips_today" 2>/dev/null || echo 0)
-    
-    if [[ $result -eq 0 ]] && [[ $line_count -gt 0 ]]; then
-        echo "    ✓ Method 1 successful - found $line_count IPs"
-        return 0
-    else
-        echo "    ✗ Method 1 failed (result: $result, lines: $line_count)"
-        return 1
-    fi
-}
-
-# METHOD 2: AWK with simple pattern
-extract_ips_method2() {
-    local today_logs="$1"
-    local ips_today="$2"
-    
-    echo "  Trying Method 2: Simple AWK extraction..."
-    
-    awk '
-    /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+ / {
-        print $1
-    }' "$today_logs" | sort | uniq -c | sort -nr | head -30 > "$ips_today" 2>/dev/null
-    
-    local result=$?
-    local line_count=$(wc -l < "$ips_today" 2>/dev/null || echo 0)
-    
-    if [[ $result -eq 0 ]] && [[ $line_count -gt 0 ]]; then
-        echo "    ✓ Method 2 successful - found $line_count IPs"
-        return 0
-    else
-        echo "    ✗ Method 2 failed (result: $result, lines: $line_count)"
-        return 1
-    fi
-}
-
-# METHOD 3: grep + sed (fallback)
-extract_ips_method3() {
-    local today_logs="$1"
-    local ips_today="$2"
-    
-    echo "  Trying Method 3: grep + sed extraction..."
-    
-    grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' "$today_logs" 2>/dev/null | \
-    sort | uniq -c | sort -nr | head -30 > "$ips_today"
-    
-    local result=$?
-    local line_count=$(wc -l < "$ips_today" 2>/dev/null || echo 0)
-    
-    if [[ $result -eq 0 ]] && [[ $line_count -gt 0 ]]; then
-        echo "    ✓ Method 3 successful - found $line_count IPs"
-        return 0
-    else
-        echo "    ✗ Method 3 failed (result: $result, lines: $line_count)"
-        return 1
-    fi
-}
-
-# METHOD 4: Ultra compatible - manual processing
-extract_ips_method4() {
-    local today_logs="$1"
-    local ips_today="$2"
-    
-    echo "  Trying Method 4: Manual processing..."
-    
-    # Create a temporary file for processing
-    local temp_file="${TEMP_PREFIX}.$$.temp_ips"
-    
-    # Process each line manually
-    while IFS= read -r line; do
-        # Extract first word
-        local first_word
-        first_word=$(echo "$line" | awk '{print $1}')
-        
-        # Check if it looks like an IP address
-        if [[ "$first_word" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "$first_word"
-        fi
-    done < "$today_logs" | sort | uniq -c | sort -nr | head -30 > "$ips_today"
-    
-    local result=$?
-    local line_count=$(wc -l < "$ips_today" 2>/dev/null || echo 0)
-    
-    rm -f "$temp_file" 2>/dev/null
-    
-    if [[ $result -eq 0 ]] && [[ $line_count -gt 0 ]]; then
-        echo "    ✓ Method 4 successful - found $line_count IPs"
-        return 0
-    else
-        echo "    ✗ Method 4 failed (result: $result, lines: $line_count)"
-        return 1
-    fi
-}
-
-# Main IP extraction function with fallbacks
+# SIMPLE IP extraction using grep -Rai
 extract_ip_addresses() {
-    local today_logs="$1"
+    local log_dir="$1"
     local ips_today="$2"
     
-    echo "Extracting IP addresses..."
+    echo "Extracting IP addresses using grep -Rai..."
     
-    if [[ ! -f "$today_logs" ]]; then
-        echo "Error: Today's logs file does not exist: $today_logs" >&2
-        return 1
-    fi
+    # Use grep -Rai to find all IPs in log directory
+    grep -Rai -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' "$log_dir" 2>/dev/null | \
+    while read -r ip; do
+        # Skip private IPs
+        if [[ "$ip" =~ ^10\. ]] || [[ "$ip" =~ ^192\.168\. ]] || [[ "$ip" =~ ^127\. ]]; then
+            continue
+        fi
+        if [[ "$ip" =~ ^172\.(1[6-9]|2[0-9]|3[0-1])\. ]]; then
+            continue
+        fi
+        echo "$ip"
+    done | sort | uniq -c | sort -nr | head -30 > "$ips_today"
     
-    if [[ ! -s "$today_logs" ]]; then
-        echo "Error: Today's logs file is empty: $today_logs" >&2
-        return 1
-    fi
+    local result=$?
+    local line_count=$(wc -l < "$ips_today" 2>/dev/null || echo 0)
     
-    echo "  Input file size: $(wc -l < "$today_logs") lines"
-    
-    # Try each method in order until one works
-    if extract_ips_method1 "$today_logs" "$ips_today"; then
-        return 0
-    elif extract_ips_method2 "$today_logs" "$ips_today"; then
-        return 0
-    elif extract_ips_method3 "$today_logs" "$ips_today"; then
-        return 0
-    elif extract_ips_method4 "$today_logs" "$ips_today"; then
+    if [[ $result -eq 0 ]] && [[ $line_count -gt 0 ]]; then
+        echo "✓ Successfully extracted $line_count unique IP addresses"
         return 0
     else
-        echo "Error: All IP extraction methods failed" >&2
-        echo "Debug info:"
-        echo "  Input file: $today_logs"
-        echo "  Input file exists: $([[ -f "$today_logs" ]] && echo "YES" || echo "NO")"
-        echo "  Input file size: $(wc -l < "$today_logs" 2>/dev/null || echo 0) lines"
-        echo "  First 3 lines of input:"
-        head -3 "$today_logs" | sed 's/^/    /'
+        echo "Error: Failed to extract IP addresses (result: $result, lines: $line_count)" >&2
         return 1
     fi
 }
@@ -494,7 +371,7 @@ main() {
     log_count=$(wc -l < "$today_logs" 2>/dev/null || echo 0)
 
     if [[ $log_count -eq 0 ]]; then
-        echo "No today's traffic found in current logs. Checking all dates in current logs..."
+        echo "No today's traffic found in current logs. Using all traffic from current logs..."
         # If no today's traffic, use all traffic from current logs
         for file in $log_files; do
             if [[ -r "$file" ]]; then
@@ -511,8 +388,8 @@ main() {
 
     echo "Found $log_count log entries"
 
-    # Extract unique IPs using fallback methods
-    if ! extract_ip_addresses "$today_logs" "$ips_today"; then
+    # Extract unique IPs using simple grep -Rai method
+    if ! extract_ip_addresses "$log_dir" "$ips_today"; then
         exit 1
     fi
 
