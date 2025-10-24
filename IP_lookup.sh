@@ -110,7 +110,8 @@ extract_todays_ips() {
     # Check if we got any log entries
     total_lines=$(wc -l < "/tmp/logs.$$" 2>/dev/null || echo 0)
     
-    if [[ $total_lines -eq 0 ]]; then
+    # FIXED: Use string comparison instead of arithmetic to avoid syntax errors
+    if [[ "$total_lines" == "0" ]]; then
         echo "Error: No log entries found" >&2
         return 1
     fi
@@ -129,7 +130,8 @@ extract_todays_ips() {
         ip_count=$(wc -l < "$output_file" 2>/dev/null || echo 0)
     fi
     
-    if [[ $ip_count -eq 0 ]]; then
+    # FIXED: Use string comparison
+    if [[ "$ip_count" == "0" ]]; then
         echo "Error: No IP addresses could be extracted"
         echo "Debug: First 3 lines of log file:"
         head -3 "/tmp/logs.$$" | sed 's/^/  /'
@@ -162,11 +164,12 @@ check_ip_threat() {
 get_risk_level() {
     local pulses="$1"
     
-    if [[ $pulses -gt 10 ]]; then
+    # FIXED: Use string comparison to avoid syntax errors
+    if [[ "$pulses" -gt 10 ]]; then
         echo "HIGH"
-    elif [[ $pulses -gt 5 ]]; then
+    elif [[ "$pulses" -gt 5 ]]; then
         echo "MEDIUM" 
-    elif [[ $pulses -gt 0 ]]; then
+    elif [[ "$pulses" -gt 0 ]]; then
         echo "LOW"
     else
         echo "CLEAN"
