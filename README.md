@@ -1,4 +1,4 @@
-# Simple IP Threat Intelligence Scanner
+# Overall Threat Intelligence Scanner
 
 A lightweight, automatic IP threat detection script that finds and analyzes web server logs to identify malicious IP addresses.
 
